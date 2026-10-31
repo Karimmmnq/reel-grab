@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: reel-grab
+    runtime: docker
+    plan: free
+    healthCheckPath: /
