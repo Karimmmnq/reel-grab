@@ -1,6 +1,4 @@
-REEL GRAB BACKEND
-1. Upload ALL these files (server.py, requirements.txt, Dockerfile, render.yaml) to a new GitHub repository, at the top level.
-2. Render.com > New > Web Service > pick the repo > Runtime: Docker > Plan: Free > Deploy.
-3. When done, open your Render address in a browser. You should see {"status":"ok"}.
-4. That address is your backend URL. Paste it into the website's Server settings.
-Optional: add environment variable ALLOWED_ORIGIN = https://YOUR-SITE.netlify.app
+UPDATE YOUR BACKEND (adds the automatic HEVC -> H.264 video converter)
+1. Open your GitHub repository 'reel-grab'.
+2. Add file > Upload files > drop the new server.py (replace the old one) > Commit changes.
+3. Render redeploys automatically (2-3 minutes). Wait until it says Live.
