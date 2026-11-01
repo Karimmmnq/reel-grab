@@ -1,5 +1,5 @@
 """Reel Grab backend (Flask + yt-dlp + ffmpeg). Deploy with the included Dockerfile."""
-import os, re, shutil, subprocess, tempfile
+import json, os, re, shutil, subprocess, tempfile, threading, time, uuid
 from flask import Flask, request, jsonify, send_file, after_this_request
 import yt_dlp
 
@@ -116,9 +116,118 @@ def download():
     name = re.sub(r"[^\w\- ]+", "", d.get("title") or d["id"])[:60].strip() or d["id"]
     return send_file(path, as_attachment=True, download_name=name + os.path.splitext(path)[1])
 
+JOBS = os.path.join(tempfile.gettempdir(), "rgjobs")
+os.makedirs(JOBS, exist_ok=True)
+
+def parse_opts(form):
+    def num(key, default):
+        try:
+            return int(form.get(key, default))
+        except (TypeError, ValueError):
+            return default
+    return {"maxh": min(2160, max(240, num("maxh", 1080))), "fps": num("fps", 30),
+            "secs": min(180, max(5, num("t", 30))), "audio": form.get("audio", "1") == "1"}
+
+def make_cmd(src, out, o, extra=()):
+    vf = "scale=-2:'min(%d,ih)'" % o["maxh"] + (",fps=%d" % o["fps"] if o["fps"] > 0 else "")
+    cmd = ["ffmpeg", "-y", *extra, "-i", src, "-t", str(o["secs"]), "-vf", vf,
+           "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-pix_fmt", "yuv420p"]
+    cmd += ["-c:a", "aac", "-b:a", "128k"] if o["audio"] else ["-an"]
+    return cmd + ["-movflags", "+faststart", out]
+
+def write_status(jid, **kw):
+    p = os.path.join(JOBS, jid, "status.json")
+    with open(p + ".tmp", "w") as fh:
+        json.dump(kw, fh)
+    os.replace(p + ".tmp", p)
+
+def sweep():
+    now = time.time()
+    for d in os.listdir(JOBS):
+        p = os.path.join(JOBS, d)
+        try:
+            if now - os.path.getmtime(p) > 1800:
+                shutil.rmtree(p, ignore_errors=True)
+        except OSError:
+            pass
+
+def run_job(jid, o):
+    d = os.path.join(JOBS, jid)
+    src, out = os.path.join(d, "in" + o["ext"]), os.path.join(d, "out.mp4")
+    try:
+        total = float(o["secs"])
+        try:
+            pr = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
+                                 "default=nw=1:nk=1", src], capture_output=True, text=True, timeout=60)
+            total = max(1.0, min(float(pr.stdout.strip()), total))
+        except Exception:
+            pass
+        write_status(jid, state="running", pct=0)
+        proc = subprocess.Popen(make_cmd(src, out, o, ("-progress", "pipe:1", "-nostats")),
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        timer = threading.Timer(900, proc.kill)
+        timer.start()
+        last = 0
+        for line in proc.stdout:
+            if line.startswith("out_time_ms="):
+                try:
+                    pct = min(99, int(int(line.split("=")[1]) / 1e6 / total * 100))
+                except ValueError:
+                    continue
+                if pct != last:
+                    last = pct
+                    write_status(jid, state="running", pct=pct)
+        proc.wait()
+        timer.cancel()
+        ok = proc.returncode == 0 and os.path.exists(out)
+        write_status(jid, state="done" if ok else "error", pct=100 if ok else 0)
+    except Exception:
+        write_status(jid, state="error", pct=0)
+
+@app.route("/api/convert/start", methods=["POST", "OPTIONS"])
+def convert_start():
+    """Start a background conversion and return a job id so the page can show real progress."""
+    if request.method == "OPTIONS":
+        return "", 204
+    f = request.files.get("file")
+    if not f:
+        return jsonify(error="No file."), 400
+    sweep()
+    jid = uuid.uuid4().hex[:16]
+    os.makedirs(os.path.join(JOBS, jid))
+    o = parse_opts(request.form)
+    o["ext"] = os.path.splitext(f.filename or "")[1][:6] or ".mp4"
+    f.save(os.path.join(JOBS, jid, "in" + o["ext"]))
+    write_status(jid, state="queued", pct=0)
+    threading.Thread(target=run_job, args=(jid, o), daemon=True).start()
+    return jsonify(id=jid)
+
+@app.route("/api/convert/status/<jid>")
+def convert_status(jid):
+    if not re.fullmatch(r"[0-9a-f]{16}", jid):
+        return jsonify(error="bad id"), 400
+    try:
+        with open(os.path.join(JOBS, jid, "status.json")) as fh:
+            return jsonify(json.load(fh))
+    except Exception:
+        return jsonify(state="error", pct=0), 404
+
+@app.route("/api/convert/result/<jid>")
+def convert_result(jid):
+    out = os.path.join(JOBS, jid, "out.mp4")
+    if not re.fullmatch(r"[0-9a-f]{16}", jid) or not os.path.exists(out):
+        return jsonify(error="Not found."), 404
+
+    @after_this_request
+    def cleanup(resp):
+        shutil.rmtree(os.path.join(JOBS, jid), ignore_errors=True)
+        return resp
+
+    return send_file(out, mimetype="video/mp4", as_attachment=True, download_name="converted.mp4")
+
 @app.route("/api/convert", methods=["POST", "OPTIONS"])
 def convert():
-    """Re-encode HEVC (or any phone video) to H.264 MP4, max 1080p / 30fps, so every browser can use it."""
+    """Single-request converter (kept for older pages)."""
     if request.method == "OPTIONS":
         return "", 204
     f = request.files.get("file")
@@ -128,22 +237,8 @@ def convert():
     src = os.path.join(tmp, "in" + (os.path.splitext(f.filename or "")[1][:6] or ".mp4"))
     out = os.path.join(tmp, "out.mp4")
     f.save(src)
-    def num(key, default):
-        try:
-            return int(request.form.get(key, default))
-        except (TypeError, ValueError):
-            return default
-    maxh = min(2160, max(240, num("maxh", 1080)))
-    fps = num("fps", 30)
-    secs = min(180, max(5, num("t", 30)))
-    keep_audio = request.form.get("audio", "1") == "1"
-    vf = "scale=-2:'min(%d,ih)'" % maxh + (",fps=%d" % fps if fps > 0 else "")
-    cmd = ["ffmpeg", "-y", "-i", src, "-t", str(secs), "-vf", vf,
-           "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-pix_fmt", "yuv420p"]
-    cmd += ["-c:a", "aac", "-b:a", "128k"] if keep_audio else ["-an"]
-    cmd += ["-movflags", "+faststart", out]
     try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=280)
+        subprocess.run(make_cmd(src, out, parse_opts(request.form)), check=True, capture_output=True, timeout=280)
     except Exception:
         shutil.rmtree(tmp, ignore_errors=True)
         return jsonify(error="Conversion failed."), 422
