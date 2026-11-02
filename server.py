@@ -24,7 +24,39 @@ def valid(url):
 def has(f, key):
     return f.get(key) not in (None, "none")
 
-def pick_video(formats, cap=None):
+def vkind(f):
+    """Classify a format's video codec: h264, hevc (H.265) or other."""
+    c = ((f.get("vcodec") or "") + " " + (f.get("format_id") or "")).lower()
+    if "bytevc1" in c or c.startswith(("hvc", "hev", "h265")) or " hvc" in c or " hev" in c or "h265" in c:
+        return "hevc"
+    if c.startswith(("avc", "h264")) or "h264" in c or " avc" in c:
+        return "h264"
+    return "other"
+
+def probe_codec(path):
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                            "stream=codec_name", "-of", "csv=p=0", path], capture_output=True, text=True, timeout=30)
+        return r.stdout.strip().split(",")[0].lower()
+    except Exception:
+        return ""
+
+def ensure_codec(path, codec, tmp):
+    """For 'h264': if the file turned out to be H.265 (or anything else), convert it so it plays everywhere."""
+    if codec != "h264" or probe_codec(path) in ("h264", ""):
+        return path
+    out = os.path.join(tmp, "h264.mp4")
+    for audio in (["-c:a", "copy"], ["-c:a", "aac", "-b:a", "192k"]):
+        try:
+            subprocess.run(["ffmpeg", "-y", "-i", path, "-c:v", "libx264", "-preset", "veryfast", "-crf", "17",
+                            "-pix_fmt", "yuv420p", *audio, "-movflags", "+faststart", out],
+                           check=True, capture_output=True, timeout=240)
+            return out
+        except Exception:
+            continue
+    return path
+
+def pick_video(formats, cap=None, codec="h264"):
     """Choose the highest-quality video format: biggest resolution, then biggest bitrate,
     then biggest file. Watermarked copies are skipped when a clean one exists."""
     vids = [f for f in formats if has(f, "vcodec") or (has(f, "acodec") and f.get("height"))]
@@ -34,6 +66,8 @@ def pick_video(formats, cap=None):
     vids = clean or vids
     if cap:
         vids = [f for f in vids if (f.get("height") or 0) <= cap] or vids
+    if codec in ("h264", "hevc"):
+        vids = [f for f in vids if vkind(f) == codec] or vids
     if not vids:
         return None
     return max(vids, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0,
@@ -70,6 +104,8 @@ def download():
     if not valid(url):
         return jsonify(error="Invalid link."), 400
     kind = a.get("type", "video")
+    codec = a.get("codec", "h264")
+    codec = codec if codec in ("h264", "hevc", "any") else "h264"
     tmp = tempfile.mkdtemp(prefix="reelgrab_")
     opts = {"quiet": True, "outtmpl": os.path.join(tmp, "%(id)s.%(ext)s")}
 
@@ -84,7 +120,7 @@ def download():
         try:
             with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True}) as y:
                 meta = y.extract_info(url, download=False)
-            best = pick_video(meta.get("formats", []), cap)
+            best = pick_video(meta.get("formats", []), cap, codec)
         except Exception:
             best = None
         if best:
@@ -104,6 +140,8 @@ def download():
         path = os.path.join(tmp, d["id"] + ext)
         if not os.path.exists(path):
             path = next(os.path.join(tmp, f) for f in os.listdir(tmp))
+        if kind != "audio":
+            path = ensure_codec(path, codec, tmp)
     except Exception:
         shutil.rmtree(tmp, ignore_errors=True)
         return jsonify(error="Download failed. Try another quality."), 422
