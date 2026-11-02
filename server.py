@@ -164,12 +164,13 @@ def parse_opts(form):
         except (TypeError, ValueError):
             return default
     return {"maxh": min(2160, max(240, num("maxh", 1080))), "fps": num("fps", 30),
-            "secs": min(180, max(5, num("t", 30))), "audio": form.get("audio", "1") == "1"}
+            "secs": min(180, max(5, num("t", 30))), "audio": form.get("audio", "1") == "1",
+            "hq": form.get("q", "std") == "high"}
 
 def make_cmd(src, out, o, extra=()):
     vf = "scale=-2:'min(%d,ih)'" % o["maxh"] + (",fps=%d" % o["fps"] if o["fps"] > 0 else "")
     cmd = ["ffmpeg", "-y", *extra, "-i", src, "-t", str(o["secs"]), "-vf", vf,
-           "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-pix_fmt", "yuv420p"]
+           "-c:v", "libx264", "-preset", "ultrafast", "-crf", "15" if o.get("hq") else "21", "-pix_fmt", "yuv420p"]
     cmd += ["-c:a", "aac", "-b:a", "128k"] if o["audio"] else ["-an"]
     return cmd + ["-movflags", "+faststart", out]
 
